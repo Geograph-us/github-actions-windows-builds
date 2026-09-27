@@ -8,12 +8,26 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1. Клонируем исходный код Ladybird
+      # 1. Освобождаем место на диске (удаляем тяжелые ненужные пакеты виртуальной машины)
+      - name: Free Disk Space
+        shell: pwsh
+        run: |
+          Write-Host "Свободное место до очистки:"
+          Get-PSDrive C, D | Select-Object Name, @{Name="Free (GB)";Expression={[math]::round($_.Free/1GB,2)}}
+
+          Remove-Item -Recurse -Force "C:\Program Files\dotnet" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache" -ErrorAction SilentlyContinue
+
+          Write-Host "Свободное место после очистки:"
+          Get-PSDrive C, D | Select-Object Name, @{Name="Free (GB)";Expression={[math]::round($_.Free/1GB,2)}}
+
+      # 2. Клонируем исходный код Ladybird
       - name: Clone Ladybird repo
         run: |
           git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
 
-      # 2. Устанавливаем базовые инструменты сборки
+      # 3. Устанавливаем базовые инструменты сборки
       - name: Install build tools via Chocolatey
         shell: pwsh
         run: |
@@ -23,11 +37,10 @@ jobs:
           choco install -y ninja
           choco install -y llvm
           choco install -y pkgconfiglite
-          choco install -y qt6-base-dev qt6-tools
           choco install -y nasm
           choco install -y zip unzip
 
-      # 3. Включаем кэш vcpkg (чтобы не пересобирать зависимости каждый раз)
+      # 4. Кэширование vcpkg артефактов
       - name: Cache vcpkg artifacts
         uses: actions/cache@v4
         with:
@@ -38,10 +51,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-vcpkg-
 
-      # 4. Конфигурируем CMake через vcpkg (автоматически ставит FastFloat, mimalloc, ICU и др.)
+      # 5. Конфигурируем CMake через vcpkg (СТРОГО Release режим!)
       - name: Configure CMake with vcpkg
         working-directory: ladybird
         shell: bash
+        env:
+          VCPKG_BUILD_TYPE: release
         run: |
           mkdir build
           cd build
@@ -51,14 +66,15 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET="x64-windows" \
+            -DVCPKG_BUILD_TYPE=release \
             ..
 
-      # 5. Компилируем Ladybird
+      # 6. Компилируем Ladybird
       - name: Build Ladybird
         working-directory: ladybird
         run: cmake --build build --config Release
 
-      # 6. Упаковываем готовый результат и необходимые DLL
+      # 7. Упаковываем готовый результат и необходимые DLL
       - name: Package Ladybird.exe and DLLs
         working-directory: ladybird
         shell: pwsh
@@ -69,33 +85,20 @@ jobs:
           # Копируем исполнительный файл
           $exePath = Get-ChildItem -Path build -Filter "ladybird.exe" -Recurse | Select-Object -First 1
           if (-Not $exePath) {
-            Write-Error "Ladybird.exe not found in build directory."
+            Write-Error "Ladybird.exe не найден в каталоге build."
             exit 1
           }
           Copy-Item $exePath.FullName -Destination $out
 
-          # Копируем все динамические библиотеки (DLL), скомпилированные vcpkg
+          # Копируем все скомпилированные DLL от vcpkg
           if (Test-Path "build/vcpkg_installed/x64-windows/bin/*.dll") {
             Copy-Item "build/vcpkg_installed/x64-windows/bin/*.dll" -Destination $out -Force
-          }
-
-          # Копируем Qt6 DLLs
-          $qmake = Get-Command qmake -ErrorAction SilentlyContinue
-          if ($qmake) {
-            $qtBin = Split-Path ($qmake.Source)
-            Copy-Item "$qtBin\Qt6*.dll" -Destination $out -Force
-
-            $platformDir = Join-Path $qtBin "plugins\platforms"
-            if (Test-Path $platformDir) {
-              New-Item -ItemType Directory -Path "$out\platforms" -Force | Out-Null
-              Copy-Item "$platformDir\*.dll" -Destination "$out\platforms" -Force
-            }
           }
 
           # Архивация в ZIP
           Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
 
-      # 7. Выгружаем готовый архив в раздел Artifacts
+      # 8. Выгружаем готовый архив в раздел Artifacts
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
