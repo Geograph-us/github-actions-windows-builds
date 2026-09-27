@@ -27,17 +27,30 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 240
 
-    env:
-      # Ладыбёрд сам качает и бутстрапит vcpkg в Toolchain/Tarballs/vcpkg
-      LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
-
     steps:
+      - name: Enable Windows/Git long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
       - name: Checkout Ladybird
         uses: actions/checkout@v6
         with:
           repository: LadybirdBrowser/ladybird
           ref: ${{ inputs.ref || 'master' }}
           submodules: recursive
+
+      # GitHub Actions по умолчанию клонирует репозиторий в путь вида
+      # D:\a\<repo>\<repo>\..., а глубоко вложенные буилд-деревья vcpkg для Qt
+      # (buildtrees\qtbase\...) легко превышают MAX_PATH = 260 символов.
+      # Это приводит к ошибке MSVC:
+      #   fatal error C1083: Cannot open compiler generated file: '': Invalid argument
+      # Лечится подключением реального чекаута под короткую букву диска.
+      - name: Mount short path (subst L: -> workspace)
+        shell: cmd
+        run: subst L: "%GITHUB_WORKSPACE%"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -67,6 +80,8 @@ jobs:
 
       # Кэшируем каталог vcpkg с уже собранными портами, чтобы не пересобирать
       # ICU/Skia/Qt и прочие тяжёлые зависимости при каждом запуске.
+      # Путь указан относительно обычного GITHUB_WORKSPACE — это те же файлы,
+      # что видны через L:\, subst лишь даёт второй короткий алиас на ту же папку.
       - name: Cache vcpkg
         uses: actions/cache@v4
         with:
@@ -80,21 +95,25 @@ jobs:
 
       - name: Build Ladybird (Release)
         shell: cmd
+        working-directory: L:\
         run: |
           python Meta\ladybird.py build
 
       - name: Install to distributable folder
         shell: cmd
+        working-directory: L:\
         run: |
           cmake --install Build\release --prefix Build\dist
 
       - name: List installed files (диагностика)
         shell: pwsh
+        working-directory: L:\
         run: Get-ChildItem -Recurse Build\dist | Select-Object -First 200 FullName
 
       - name: Determine package version
         id: version
         shell: pwsh
+        working-directory: L:\
         run: |
           $sha = (git rev-parse --short HEAD)
           $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/', '' } else { $sha }
@@ -102,14 +121,15 @@ jobs:
 
       - name: Package into zip
         shell: pwsh
+        working-directory: L:\
         run: |
           $zipName = "ladybird-windows-x64-${{ steps.version.outputs.version }}.zip"
-          Compress-Archive -Path Build\dist\* -DestinationPath $zipName
+          Compress-Archive -Path Build\dist\* -DestinationPath "L:\$zipName"
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ladybird-windows-x64-${{ steps.version.outputs.version }}
-          path: ${{ env.ZIP_NAME }}
+          path: L:\${{ env.ZIP_NAME }}
           retention-days: 14
