@@ -1,0 +1,85 @@
+name: Build Ladybird (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 1. Клонируем исходный код Ladybird
+      - name: Clone Ladybird repo
+        run: |
+          git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
+
+      # 2. Устанавливаем все необходимые инструменты и зависимости (включая pkgconfiglite и Qt6)
+      - name: Install build tools via Chocolatey
+        shell: pwsh
+        run: |
+          choco feature enable -n allowGlobalConfirmation
+          choco install -y git
+          choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+          choco install -y ninja
+          choco install -y llvm
+          choco install -y pkgconfiglite
+          choco install -y qt6-base-dev qt6-tools
+          choco install -y nasm
+          choco install -y zip unzip
+
+      # 3. Конфигурируем CMake (указываем working-directory: ladybird)
+      - name: Configure CMake
+        working-directory: ladybird
+        shell: bash
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            ..
+
+      # 4. Компилируем Ladybird
+      - name: Build Ladybird
+        working-directory: ladybird
+        run: cmake --build build --config Release
+
+      # 5. Упаковываем exe и зависимые библиотеки (DLL)
+      - name: Package Ladybird.exe and DLLs
+        working-directory: ladybird
+        shell: pwsh
+        run: |
+          $out = "$PWD/artifact"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+          # Копируем исполнительный файл
+          $exePath = Get-ChildItem -Path build -Filter "ladybird.exe" -Recurse | Select-Object -First 1
+          if (-Not $exePath) {
+            Write-Error "Ladybird.exe not found in build directory."
+            exit 1
+          }
+          Copy-Item $exePath.FullName -Destination $out
+
+          # Поиск и копирование необходимых DLL от Qt6
+          $qmake = Get-Command qmake -ErrorAction SilentlyContinue
+          if ($qmake) {
+            $qtBin = Split-Path ($qmake.Source)
+            Copy-Item "$qtBin\Qt6*.dll" -Destination $out -Force
+
+            $platformDir = Join-Path $qtBin "plugins\platforms"
+            if (Test-Path $platformDir) {
+              New-Item -ItemType Directory -Path "$out\platforms" -Force | Out-Null
+              Copy-Item "$platformDir\*.dll" -Destination "$out\platforms" -Force
+            }
+          }
+
+          # Архивация результата
+          Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
+
+      # 6. Сохраняем готовый ZIP-архив в Actions Artifacts
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-windows
+          path: ladybird-windows.zip
