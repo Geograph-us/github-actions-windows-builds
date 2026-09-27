@@ -3,31 +3,51 @@ name: Build Ladybird (Windows)
 on:
   workflow_dispatch:
 
+env:
+  TEMP: "D:\\tmp"
+  TMP: "D:\\tmp"
+  VCPKG_ROOT: "D:\\vcpkg"
+
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      # 1. Освобождаем место на диске (удаляем тяжелые ненужные пакеты виртуальной машины)
-      - name: Free Disk Space
+      # 1. Переносим vcpkg на D:
+      - name: Relocate vcpkg to Drive D:
         shell: pwsh
         run: |
-          Write-Host "Свободное место до очистки:"
+          New-Item -ItemType Directory -Path "D:\tmp" -Force | Out-Null
+          if (Test-Path "C:\vcpkg") {
+            Write-Host "Переносим vcpkg на диск D:..."
+            Move-Item -Path "C:\vcpkg" -Destination "D:\vcpkg" -Force
+          }
           Get-PSDrive C, D | Select-Object Name, @{Name="Free (GB)";Expression={[math]::round($_.Free/1GB,2)}}
 
-          Remove-Item -Recurse -Force "C:\Program Files\dotnet" -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force "C:\hostedtoolcache" -ErrorAction SilentlyContinue
+      # 2. Создаем кастомный триплет, который СТРОГО запрещает Debug сборку
+      - name: Create Custom Release Triplet
+        shell: pwsh
+        run: |
+          $tripletContent = @"
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          set(VCPKG_BUILD_TYPE release)
+          "@
+          New-Item -Path "D:\vcpkg\triplets\custom-x64-rel.cmake" -Value $tripletContent -Force
 
-          Write-Host "Свободное место после очистки:"
-          Get-PSDrive C, D | Select-Object Name, @{Name="Free (GB)";Expression={[math]::round($_.Free/1GB,2)}}
-
-      # 2. Клонируем исходный код Ladybird
+      # 3. Клонируем исходный код Ladybird
       - name: Clone Ladybird repo
         run: |
           git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
 
-      # 3. Устанавливаем базовые инструменты сборки
+      # 4. Подготавливаем Python 3 для CMake
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 5. Устанавливаем базовые инструменты сборки
       - name: Install build tools via Chocolatey
         shell: pwsh
         run: |
@@ -40,23 +60,21 @@ jobs:
           choco install -y nasm
           choco install -y zip unzip
 
-      # 4. Кэширование vcpkg артефактов
+      # 6. Кэширование vcpkg артефактов на диске D:
       - name: Cache vcpkg artifacts
         uses: actions/cache@v4
         with:
           path: |
-            C:/vcpkg/installed
-            ~/.cache/vcpkg
+            D:/vcpkg/installed
+            D:/vcpkg/downloads
           key: ${{ runner.os }}-vcpkg-${{ hashFiles('ladybird/vcpkg.json') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-
 
-      # 5. Конфигурируем CMake через vcpkg (СТРОГО Release режим!)
+      # 7. Конфигурируем CMake с использованием кастомного триплета custom-x64-rel
       - name: Configure CMake with vcpkg
         working-directory: ladybird
         shell: bash
-        env:
-          VCPKG_BUILD_TYPE: release
         run: |
           mkdir build
           cd build
@@ -64,17 +82,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET="x64-windows" \
-            -DVCPKG_BUILD_TYPE=release \
+            -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET="custom-x64-rel" \
             ..
 
-      # 6. Компилируем Ladybird
+      # 8. Компилируем Ladybird
       - name: Build Ladybird
         working-directory: ladybird
         run: cmake --build build --config Release
 
-      # 7. Упаковываем готовый результат и необходимые DLL
+      # 9. Упаковываем готовый результат и DLL
       - name: Package Ladybird.exe and DLLs
         working-directory: ladybird
         shell: pwsh
@@ -90,15 +107,15 @@ jobs:
           }
           Copy-Item $exePath.FullName -Destination $out
 
-          # Копируем все скомпилированные DLL от vcpkg
-          if (Test-Path "build/vcpkg_installed/x64-windows/bin/*.dll") {
-            Copy-Item "build/vcpkg_installed/x64-windows/bin/*.dll" -Destination $out -Force
+          # Копируем скомпилированные DLL от vcpkg
+          if (Test-Path "build/vcpkg_installed/custom-x64-rel/bin/*.dll") {
+            Copy-Item "build/vcpkg_installed/custom-x64-rel/bin/*.dll" -Destination $out -Force
           }
 
           # Архивация в ZIP
           Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
 
-      # 8. Выгружаем готовый архив в раздел Artifacts
+      # 10. Выгружаем готовый архив в раздел Artifacts
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
