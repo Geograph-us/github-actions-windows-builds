@@ -3,11 +3,6 @@ name: Build Ladybird (Windows)
 on:
   workflow_dispatch:
 
-env:
-  TEMP: "D:\\tmp"
-  TMP: "D:\\tmp"
-  VCPKG_ROOT: "D:\\vcpkg"
-
 jobs:
   build:
     runs-on: windows-latest
