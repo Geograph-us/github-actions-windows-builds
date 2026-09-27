@@ -48,9 +48,9 @@ jobs:
       # Это приводит к ошибке MSVC:
       #   fatal error C1083: Cannot open compiler generated file: '': Invalid argument
       # Лечится подключением реального чекаута под короткую букву диска.
-      - name: Mount short path (subst L: -> workspace)
+      - name: "Mount short path (subst L: -> workspace)"
         shell: cmd
-        run: subst L: "%GITHUB_WORKSPACE%"
+        run: 'subst L: "%GITHUB_WORKSPACE%"'
 
       - name: Set up Python
         uses: actions/setup-python@v5
