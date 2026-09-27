@@ -8,12 +8,12 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1. Клонируем исходный код Ladybird со всеми субмодулями
+      # 1. Клонируем исходный код Ladybird
       - name: Clone Ladybird repo
         run: |
           git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
 
-      # 2. Устанавливаем все инструменты и зависимости через Chocolatey
+      # 2. Устанавливаем системные утилиты и библиотеки через Chocolatey
       - name: Install build tools via Chocolatey
         shell: pwsh
         run: |
@@ -23,12 +23,27 @@ jobs:
           choco install -y ninja
           choco install -y llvm
           choco install -y pkgconfiglite
-          choco install -y mimalloc
           choco install -y qt6-base-dev qt6-tools
           choco install -y nasm
           choco install -y zip unzip
 
-      # 3. Конфигурируем CMake
+      # 3. Собираем и устанавливаем mimalloc из исходников
+      - name: Build and install mimalloc
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/microsoft/mimalloc.git
+          cd mimalloc
+          mkdir build
+          cd build
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_INSTALL_PREFIX="C:/mimalloc" \
+            ..
+          cmake --build . --config Release --target install
+
+      # 4. Конфигурируем CMake для Ladybird (указываем путь к mimalloc)
       - name: Configure CMake
         working-directory: ladybird
         shell: bash
@@ -39,14 +54,15 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="C:/mimalloc" \
             ..
 
-      # 4. Компилируем Ladybird
+      # 5. Компилируем Ladybird
       - name: Build Ladybird
         working-directory: ladybird
         run: cmake --build build --config Release
 
-      # 5. Упаковываем exe и DLL
+      # 6. Упаковываем exe и DLL
       - name: Package Ladybird.exe and DLLs
         working-directory: ladybird
         shell: pwsh
@@ -61,6 +77,11 @@ jobs:
             exit 1
           }
           Copy-Item $exePath.FullName -Destination $out
+
+          # Копируем mimalloc.dll, если она скомпилировалась отдельно
+          if (Test-Path "C:/mimalloc/bin/*.dll") {
+            Copy-Item "C:/mimalloc/bin/*.dll" -Destination $out -Force
+          }
 
           # Поиск и копирование необходимых DLL от Qt6
           $qmake = Get-Command qmake -ErrorAction SilentlyContinue
@@ -78,7 +99,7 @@ jobs:
           # Архивация результата
           Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
 
-      # 6. Сохраняем готовый ZIP-архив
+      # 7. Сохраняем готовый ZIP-архив
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
