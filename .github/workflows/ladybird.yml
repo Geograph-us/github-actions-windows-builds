@@ -13,7 +13,7 @@ jobs:
         run: |
           git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
 
-      # 2. Устанавливаем системные утилиты и библиотеки через Chocolatey
+      # 2. Устанавливаем базовые инструменты сборки
       - name: Install build tools via Chocolatey
         shell: pwsh
         run: |
@@ -27,24 +27,19 @@ jobs:
           choco install -y nasm
           choco install -y zip unzip
 
-      # 3. Собираем и устанавливаем mimalloc из исходников
-      - name: Build and install mimalloc
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/microsoft/mimalloc.git
-          cd mimalloc
-          mkdir build
-          cd build
-          cmake -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_INSTALL_PREFIX="C:/mimalloc" \
-            ..
-          cmake --build . --config Release --target install
+      # 3. Включаем кэш vcpkg (чтобы не пересобирать зависимости каждый раз)
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/vcpkg/installed
+            ~/.cache/vcpkg
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('ladybird/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
 
-      # 4. Конфигурируем CMake для Ladybird (указываем путь к mimalloc)
-      - name: Configure CMake
+      # 4. Конфигурируем CMake через vcpkg (автоматически ставит FastFloat, mimalloc, ICU и др.)
+      - name: Configure CMake with vcpkg
         working-directory: ladybird
         shell: bash
         run: |
@@ -54,7 +49,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_PREFIX_PATH="C:/mimalloc" \
+            -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET="x64-windows" \
             ..
 
       # 5. Компилируем Ladybird
@@ -62,7 +58,7 @@ jobs:
         working-directory: ladybird
         run: cmake --build build --config Release
 
-      # 6. Упаковываем exe и DLL
+      # 6. Упаковываем готовый результат и необходимые DLL
       - name: Package Ladybird.exe and DLLs
         working-directory: ladybird
         shell: pwsh
@@ -78,12 +74,12 @@ jobs:
           }
           Copy-Item $exePath.FullName -Destination $out
 
-          # Копируем mimalloc.dll, если она скомпилировалась отдельно
-          if (Test-Path "C:/mimalloc/bin/*.dll") {
-            Copy-Item "C:/mimalloc/bin/*.dll" -Destination $out -Force
+          # Копируем все динамические библиотеки (DLL), скомпилированные vcpkg
+          if (Test-Path "build/vcpkg_installed/x64-windows/bin/*.dll") {
+            Copy-Item "build/vcpkg_installed/x64-windows/bin/*.dll" -Destination $out -Force
           }
 
-          # Поиск и копирование необходимых DLL от Qt6
+          # Копируем Qt6 DLLs
           $qmake = Get-Command qmake -ErrorAction SilentlyContinue
           if ($qmake) {
             $qtBin = Split-Path ($qmake.Source)
@@ -96,10 +92,10 @@ jobs:
             }
           }
 
-          # Архивация результата
+          # Архивация в ZIP
           Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
 
-      # 7. Сохраняем готовый ZIP-архив
+      # 7. Выгружаем готовый архив в раздел Artifacts
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
