@@ -1,12 +1,5 @@
 name: Build Ladybird (Windows x64 Release)
 
-# Официально поддерживаемый способ сборки Ladybird на Windows — это WSL2.
-# Нативная сборка (clang-cl / MSVC) отмечена в документации проекта как
-# ЭКСПЕРИМЕНТАЛЬНАЯ ("there are still windows specific issues and the
-# functionality is limited"), поэтому сборка может падать на отдельных
-# vcpkg-портах в зависимости от текущего состояния апстрима.
-# См.: https://github.com/LadybirdBrowser/ladybird/blob/master/Documentation/BuildInstructionsLadybird.md
-
 on:
   workflow_dispatch:
     inputs:
@@ -35,26 +28,10 @@ jobs:
             -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
           git config --system core.longpaths true
 
-      # ---------------------------------------------------------------
-      # ВАЖНО: НЕ используем actions/checkout + subst.
-      #
-      # actions/checkout всегда кладёт репозиторий в GITHUB_WORKSPACE,
-      # т.е. в глубокий путь вида D:\a\<owner>\<repo>\<repo>\...
-      # `subst L: <workspace>` создаёт лишь DOS-device alias на уровне
-      # сессии Windows, а не реальный alias в файловой системе. Многие
-      # инструменты (в частности, Python's os.path.realpath(), который
-      # используется внутри Meta/ladybird.py и в части CMake-тулчейна)
-      # на Windows вызывают GetFinalPathNameByHandle и РЕЗОЛВЯТ
-      # subst-диск обратно в исходный длинный путь — то есть subst
-      # "протекает" и не решает проблему MAX_PATH.
-      #
-      # Поэтому клонируем репозиторий вручную в короткий реальный путь
-      # у корня диска (C:\lb), минуя GITHUB_WORKSPACE вообще.
-      # ---------------------------------------------------------------
-      - name: Clone Ladybird into short path (C:\lb)
+      - name: Clone Ladybird into short path (D:\l)
         shell: cmd
         run: |
-          git clone --recurse-submodules --shallow-submodules --depth 1 --branch %REF% https://github.com/LadybirdBrowser/ladybird.git C:\lb
+          git clone --recurse-submodules --shallow-submodules --depth 1 --branch %REF% https://github.com/LadybirdBrowser/ladybird.git D:\l
         env:
           REF: ${{ inputs.ref || 'master' }}
 
@@ -113,7 +90,7 @@ jobs:
 
       - name: Build Ladybird (Release)
         shell: cmd
-        working-directory: C:\lb\
+        working-directory: D:\l\
         env:
           SCCACHE_GHA_ENABLED: "true"
           CMAKE_C_COMPILER_LAUNCHER: sccache
@@ -127,19 +104,19 @@ jobs:
 
       - name: Install to distributable folder
         shell: cmd
-        working-directory: C:\lb\
+        working-directory: D:\l\
         run: |
           cmake --install Build\release --prefix Build\dist
 
       - name: List installed files (диагностика)
         shell: pwsh
-        working-directory: C:\lb\
+        working-directory: D:\l\
         run: Get-ChildItem -Recurse Build\dist | Select-Object -First 200 FullName
 
       - name: Determine package version
         id: version
         shell: pwsh
-        working-directory: C:\lb\
+        working-directory: D:\l\
         run: |
           $sha = (git rev-parse --short HEAD)
           $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/', '' } else { $sha }
@@ -147,15 +124,15 @@ jobs:
 
       - name: Package into zip
         shell: pwsh
-        working-directory: C:\lb\
+        working-directory: D:\l\
         run: |
           $zipName = "ladybird-windows-x64-${{ steps.version.outputs.version }}.zip"
-          Compress-Archive -Path Build\dist\* -DestinationPath "C:\lb\$zipName"
+          Compress-Archive -Path Build\dist\* -DestinationPath "D:\l\$zipName"
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ladybird-windows-x64-${{ steps.version.outputs.version }}
-          path: C:\lb\${{ env.ZIP_NAME }}
+          path: D:\l\${{ env.ZIP_NAME }}
           retention-days: 14
