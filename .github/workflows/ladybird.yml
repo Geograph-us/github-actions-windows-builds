@@ -1,5 +1,12 @@
 name: Build Ladybird (Windows x64 Release)
 
+# Официально поддерживаемый способ сборки Ladybird на Windows — это WSL2.
+# Нативная сборка (clang-cl / MSVC) отмечена в документации проекта как
+# ЭКСПЕРИМЕНТАЛЬНАЯ ("there are still windows specific issues and the
+# functionality is limited"), поэтому сборка может падать на отдельных
+# vcpkg-портах в зависимости от текущего состояния апстрима.
+# См.: https://github.com/LadybirdBrowser/ladybird/blob/master/Documentation/BuildInstructionsLadybird.md
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,6 +35,22 @@ jobs:
             -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
           git config --system core.longpaths true
 
+      # ---------------------------------------------------------------
+      # ВАЖНО: НЕ используем actions/checkout + subst.
+      #
+      # actions/checkout всегда кладёт репозиторий в GITHUB_WORKSPACE,
+      # т.е. в глубокий путь вида D:\a\<owner>\<repo>\<repo>\...
+      # `subst L: <workspace>` создаёт лишь DOS-device alias на уровне
+      # сессии Windows, а не реальный alias в файловой системе. Многие
+      # инструменты (в частности, Python's os.path.realpath(), который
+      # используется внутри Meta/ladybird.py и в части CMake-тулчейна)
+      # на Windows вызывают GetFinalPathNameByHandle и РЕЗОЛВЯТ
+      # subst-диск обратно в исходный длинный путь — то есть subst
+      # "протекает" и не решает проблему MAX_PATH.
+      #
+      # Поэтому клонируем репозиторий вручную в короткий реальный путь
+      # у корня диска (D:\l), минуя GITHUB_WORKSPACE вообще.
+      # ---------------------------------------------------------------
       - name: Clone Ladybird into short path (D:\l)
         shell: cmd
         run: |
@@ -81,26 +104,11 @@ jobs:
         run: |
           echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
 
-      # ---------------------------------------------------------------
-      # sccache ускоряет саму компиляцию Ladybird (LibWeb/LibJS/AK и т.д.),
-      # а не только сборку vcpkg-зависимостей. Кэш также хранится в GHA.
-      # ---------------------------------------------------------------
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
-
       - name: Build Ladybird (Release)
         shell: cmd
         working-directory: D:\l\
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
           python Meta\ladybird.py build
-
-      - name: Show sccache stats (диагностика)
-        shell: pwsh
-        run: sccache --show-stats
 
       - name: Install to distributable folder
         shell: cmd
