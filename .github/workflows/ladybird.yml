@@ -78,26 +78,46 @@ jobs:
         with:
           arch: x64
 
-      # Кэшируем каталог vcpkg с уже собранными портами, чтобы не пересобирать
-      # ICU/Skia/Qt и прочие тяжёлые зависимости при каждом запуске.
-      # Путь указан относительно обычного GITHUB_WORKSPACE — это те же файлы,
-      # что видны через L:\, subst лишь даёт второй короткий алиас на ту же папку.
-      - name: Cache vcpkg
-        uses: actions/cache@v4
+      # ---------------------------------------------------------------
+      # vcpkg binary caching через нативный GitHub Actions backend.
+      # В отличие от кэширования всей папки Toolchain/Tarballs/vcpkg,
+      # x-gha кэширует каждый порт отдельно по хешу его конфигурации —
+      # попадания случаются чаще (например, при изменении одной
+      # зависимости остальные всё равно берутся из кэша).
+      # https://learn.microsoft.com/vcpkg/users/binarycaching
+      # ---------------------------------------------------------------
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
         with:
-          path: |
-            Toolchain/Tarballs/vcpkg
-            !Toolchain/Tarballs/vcpkg/buildtrees
-            !Toolchain/Tarballs/vcpkg/downloads
-          key: vcpkg-windows-x64-${{ hashFiles('Meta/CMake/vcpkg/**', 'vcpkg.json') }}
-          restore-keys: |
-            vcpkg-windows-x64-
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Enable vcpkg binary caching (x-gha)
+        shell: pwsh
+        run: |
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
+
+      # ---------------------------------------------------------------
+      # sccache ускоряет саму компиляцию Ladybird (LibWeb/LibJS/AK и т.д.),
+      # а не только сборку vcpkg-зависимостей. Кэш также хранится в GHA.
+      # ---------------------------------------------------------------
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Build Ladybird (Release)
         shell: cmd
         working-directory: L:\
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
           python Meta\ladybird.py build
+
+      - name: Show sccache stats (диагностика)
+        shell: pwsh
+        run: sccache --show-stats
 
       - name: Install to distributable folder
         shell: cmd
