@@ -8,12 +8,12 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1. Клонируем исходный код Ladybird
+      # 1. Клонируем исходный код Ladybird со всеми субмодулями
       - name: Clone Ladybird repo
         run: |
           git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
 
-      # 2. Устанавливаем все необходимые инструменты и зависимости (включая pkgconfiglite и Qt6)
+      # 2. Устанавливаем все инструменты и зависимости через Chocolatey
       - name: Install build tools via Chocolatey
         shell: pwsh
         run: |
@@ -23,11 +23,12 @@ jobs:
           choco install -y ninja
           choco install -y llvm
           choco install -y pkgconfiglite
+          choco install -y mimalloc
           choco install -y qt6-base-dev qt6-tools
           choco install -y nasm
           choco install -y zip unzip
 
-      # 3. Конфигурируем CMake (указываем working-directory: ladybird)
+      # 3. Конфигурируем CMake
       - name: Configure CMake
         working-directory: ladybird
         shell: bash
@@ -45,7 +46,7 @@ jobs:
         working-directory: ladybird
         run: cmake --build build --config Release
 
-      # 5. Упаковываем exe и зависимые библиотеки (DLL)
+      # 5. Упаковываем exe и DLL
       - name: Package Ladybird.exe and DLLs
         working-directory: ladybird
         shell: pwsh
@@ -77,7 +78,7 @@ jobs:
           # Архивация результата
           Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
 
-      # 6. Сохраняем готовый ZIP-архив в Actions Artifacts
+      # 6. Сохраняем готовый ZIP-архив
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
