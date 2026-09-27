@@ -1,119 +1,115 @@
-name: Build Ladybird (Windows)
+name: Build Ladybird (Windows x64 Release)
+
+# Официально поддерживаемый способ сборки Ladybird на Windows — это WSL2.
+# Нативная сборка (clang-cl / MSVC) отмечена в документации проекта как
+# ЭКСПЕРИМЕНТАЛЬНАЯ ("there are still windows specific issues and the
+# functionality is limited"), поэтому сборка может падать на отдельных
+# vcpkg-портах в зависимости от текущего состояния апстрима.
+# См.: https://github.com/LadybirdBrowser/ladybird/blob/master/Documentation/BuildInstructionsLadybird.md
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ветка/тег/коммит ladybird для сборки"
+        required: false
+        default: "master"
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+    timeout-minutes: 240
+
+    env:
+      # Ладыбёрд сам качает и бутстрапит vcpkg в Toolchain/Tarballs/vcpkg
+      LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
 
     steps:
-      # 1. Переносим vcpkg на D:
-      - name: Relocate vcpkg to Drive D:
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "D:\tmp" -Force | Out-Null
-          if (Test-Path "C:\vcpkg") {
-            Write-Host "Переносим vcpkg на диск D:..."
-            Move-Item -Path "C:\vcpkg" -Destination "D:\vcpkg" -Force
-          }
-          Get-PSDrive C, D | Select-Object Name, @{Name="Free (GB)";Expression={[math]::round($_.Free/1GB,2)}}
+      - name: Checkout Ladybird
+        uses: actions/checkout@v6
+        with:
+          repository: LadybirdBrowser/ladybird
+          ref: ${{ inputs.ref || 'master' }}
+          submodules: recursive
 
-      # 2. Создаем кастомный триплет, который СТРОГО запрещает Debug сборку
-      - name: Create Custom Release Triplet
-        shell: pwsh
-        run: |
-          $tripletContent = @"
-          set(VCPKG_TARGET_ARCHITECTURE x64)
-          set(VCPKG_CRT_LINKAGE dynamic)
-          set(VCPKG_LIBRARY_LINKAGE dynamic)
-          set(VCPKG_BUILD_TYPE release)
-          "@
-          New-Item -Path "D:\vcpkg\triplets\custom-x64-rel.cmake" -Value $tripletContent -Force
-
-      # 3. Клонируем исходный код Ladybird
-      - name: Clone Ladybird repo
-        run: |
-          git clone --recursive https://github.com/LadybirdBrowser/ladybird.git
-
-      # 4. Подготавливаем Python 3 для CMake
-      - name: Set up Python 3
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.x"
 
-      # 5. Устанавливаем базовые инструменты сборки
-      - name: Install build tools via Chocolatey
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build tools (Chocolatey)
         shell: pwsh
         run: |
-          choco feature enable -n allowGlobalConfirmation
-          choco install -y git
-          choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
-          choco install -y ninja
-          choco install -y llvm
-          choco install -y pkgconfiglite
-          choco install -y nasm
-          choco install -y zip unzip
+          choco install -y nasm ninja pkgconfiglite
+          # Гарантируем свежий CMake (>= 3.30 требуется по документации проекта)
+          choco upgrade -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
 
-      # 6. Кэширование vcpkg артефактов на диске D:
-      - name: Cache vcpkg artifacts
+      - name: Refresh PATH after Chocolatey installs
+        shell: pwsh
+        run: |
+          echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
+          echo "C:\ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Кэшируем каталог vcpkg с уже собранными портами, чтобы не пересобирать
+      # ICU/Skia/Qt и прочие тяжёлые зависимости при каждом запуске.
+      - name: Cache vcpkg
         uses: actions/cache@v4
         with:
           path: |
-            D:/vcpkg/installed
-            D:/vcpkg/downloads
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('ladybird/vcpkg.json') }}
+            Toolchain/Tarballs/vcpkg
+            !Toolchain/Tarballs/vcpkg/buildtrees
+            !Toolchain/Tarballs/vcpkg/downloads
+          key: vcpkg-windows-x64-${{ hashFiles('Meta/CMake/vcpkg/**', 'vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-
+            vcpkg-windows-x64-
 
-      # 7. Конфигурируем CMake с использованием кастомного триплета custom-x64-rel
-      - name: Configure CMake with vcpkg
-        working-directory: ladybird
-        shell: bash
+      - name: Build Ladybird (Release)
+        shell: cmd
         run: |
-          mkdir build
-          cd build
-          cmake -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET="custom-x64-rel" \
-            ..
+          python Meta\ladybird.py build
 
-      # 8. Компилируем Ladybird
-      - name: Build Ladybird
-        working-directory: ladybird
-        run: cmake --build build --config Release
+      - name: Install to distributable folder
+        shell: cmd
+        run: |
+          cmake --install Build\release --prefix Build\dist
 
-      # 9. Упаковываем готовый результат и DLL
-      - name: Package Ladybird.exe and DLLs
-        working-directory: ladybird
+      - name: List installed files (диагностика)
+        shell: pwsh
+        run: Get-ChildItem -Recurse Build\dist | Select-Object -First 200 FullName
+
+      - name: Determine package version
+        id: version
         shell: pwsh
         run: |
-          $out = "$PWD/artifact"
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $sha = (git rev-parse --short HEAD)
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/', '' } else { $sha }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
 
-          # Копируем исполнительный файл
-          $exePath = Get-ChildItem -Path build -Filter "ladybird.exe" -Recurse | Select-Object -First 1
-          if (-Not $exePath) {
-            Write-Error "Ladybird.exe не найден в каталоге build."
-            exit 1
-          }
-          Copy-Item $exePath.FullName -Destination $out
+      - name: Package into zip
+        shell: pwsh
+        run: |
+          $zipName = "ladybird-windows-x64-${{ steps.version.outputs.version }}.zip"
+          Compress-Archive -Path Build\dist\* -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
-          # Копируем скомпилированные DLL от vcpkg
-          if (Test-Path "build/vcpkg_installed/custom-x64-rel/bin/*.dll") {
-            Copy-Item "build/vcpkg_installed/custom-x64-rel/bin/*.dll" -Destination $out -Force
-          }
-
-          # Архивация в ZIP
-          Compress-Archive -Path $out\* -DestinationPath ../ladybird-windows.zip -Force
-
-      # 10. Выгружаем готовый архив в раздел Artifacts
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ladybird-windows
-          path: ladybird-windows.zip
-          
+          name: ladybird-windows-x64-${{ steps.version.outputs.version }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 14
