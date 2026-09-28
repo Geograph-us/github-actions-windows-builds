@@ -1,0 +1,90 @@
+name: Build AyuGram (Windows x64 Release)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Prepare dependencies
+        shell: cmd
+        run: |
+          Telegram\build\prepare\win.bat
+
+      - name: Configure x64 Release
+        shell: cmd
+        run: |
+          cd Telegram
+          configure.bat x64 ^
+            -D TDESKTOP_API_ID=2040 ^
+            -D TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio installation not found"
+          }
+
+          Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+
+          Enter-VsDevShell `
+            -VsInstallPath $vsPath `
+            -SkipAutomaticLocation
+
+          cmake --build out --config Release --target Telegram --parallel
+
+      - name: Prepare ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+
+          $source = "out/Release"
+          $package = "AyuGram-$version-Windows-x64"
+
+          New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
+
+          Copy-Item "$source/*" `
+            -Destination "dist/$package" `
+            -Recurse `
+            -Force
+
+          Compress-Archive `
+            -Path "dist/$package" `
+            -DestinationPath "AyuGram-$version-Windows-x64.zip" `
+            -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: AyuGram ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            AyuGram-${{ github.ref_name }}-Windows-x64.zip
