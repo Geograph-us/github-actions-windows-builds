@@ -87,30 +87,55 @@ jobs:
           arch: x64
 
       # ---------------------------------------------------------------
-      # vcpkg binary caching через нативный GitHub Actions backend.
-      # В отличие от кэширования всей папки Toolchain/Tarballs/vcpkg,
-      # x-gha кэширует каждый порт отдельно по хешу его конфигурации —
-      # попадания случаются чаще (например, при изменении одной
-      # зависимости остальные всё равно берутся из кэша).
-      # https://learn.microsoft.com/vcpkg/users/binarycaching
+      # Кэш собранных vcpkg-пакетов (Qt, Skia, ICU ... ~1.5 ч сборки).
+      # Провайдер x-gha удалён из vcpkg (апрель 2025), поэтому используем
+      # файловый бинарный кэш vcpkg + официальный actions/cache.
+      # Ключ - хеш vcpkg.json и overlay-портов Ladybird; если они не менялись,
+      # пакеты просто распаковываются из кэша вместо пересборки.
+      # vcpkg сам проверяет ABI-хеш (компилятор, триплет, опции), так что
+      # устаревшие бинарники из кэша не подхватываются.
       # ---------------------------------------------------------------
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Enable vcpkg binary caching (x-gha)
+      - name: Compute vcpkg cache key
+        id: vcpkgkey
         shell: pwsh
         run: |
-          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
+          $files = @("D:\l\vcpkg.json")
+          $files += Get-ChildItem "D:\l\Meta\CMake\vcpkg" -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object FullName
+          $sb = [System.Text.StringBuilder]::new()
+          foreach ($f in $files) { [void]$sb.Append((Get-FileHash $f).Hash) }
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($sb.ToString())
+          $h = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)) -replace '-', '').Substring(0, 16)
+          echo "hash=$h" >> $env:GITHUB_OUTPUT
+
+      - name: Configure vcpkg binary cache (files)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force D:\vcpkg-cache | Out-Null
+          echo "VCPKG_BINARY_SOURCES=clear;files,D:\vcpkg-cache,readwrite" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg binary cache
+        id: vcpkgcache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\vcpkg-cache
+          key: vcpkg-bin-windows-x64-${{ steps.vcpkgkey.outputs.hash }}
+          restore-keys: |
+            vcpkg-bin-windows-x64-
 
       - name: Build Ladybird (Release)
         shell: cmd
         working-directory: D:\l\
         run: |
           python Meta\ladybird.py build
+
+      # always(): даже если сборка Ladybird упала, готовые vcpkg-пакеты сохраняются.
+      - name: Save vcpkg binary cache
+        if: ${{ always() && steps.vcpkgcache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: D:\vcpkg-cache
+          key: vcpkg-bin-windows-x64-${{ steps.vcpkgkey.outputs.hash }}
 
       - name: Install to distributable folder
         shell: cmd
@@ -149,6 +174,19 @@ jobs:
             }
           }
 
+          # VC++ runtime (app-local): чтобы браузер работал без установленного Redistributable.
+          $crt = $null
+          if ($env:VCToolsRedistDir) {
+            $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($crt) {
+            foreach ($d in @($binDir, $libexecDir)) {
+              if (Test-Path $d) { Copy-Item (Join-Path $crt.FullName "*.dll") $d -Force }
+            }
+          } else {
+            Write-Warning "VC++ runtime не найден (VCToolsRedistDir) - на чистой Windows понадобится Redistributable."
+          }
+
           # include/ и lib/ нужны только для разработки. Удаляем, если в lib нет DLL.
           # libexec/ (WebContent, RequestServer, ImageDecoder, ...) и share/ НЕ удаляем:
           # это процессы и ресурсы, без которых браузер не запустится.
@@ -174,7 +212,7 @@ jobs:
           # Проверка зависимостей: для каждого exe/dll смотрим прямые импорты (dumpbin) и
           # предупреждаем, если DLL нет ни рядом, ни в System32. Транзитивные зависимости
           # покрываются тем, что и сами DLL проверяются. VC++ runtime (vcruntime140/msvcp140)
-          # берётся из системы - на чистой машине нужен VC++ Redistributable.
+          # теперь лежит рядом с exe (копируется выше).
           if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
             $sys = Join-Path $env:WINDIR "System32"
             $missing = @()
