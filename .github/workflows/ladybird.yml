@@ -55,10 +55,13 @@ jobs:
       # ---------------------------------------------------------------
       - name: Clone Ladybird into short path (D:\l)
         shell: cmd
-        run: |
-          git clone --recurse-submodules --shallow-submodules --depth 1 --branch %REF% https://github.com/LadybirdBrowser/ladybird.git D:\l
         env:
           REF: ${{ inputs.ref || 'master' }}
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/LadybirdBrowser/ladybird.git D:\l
+          cd /d D:\l
+          git checkout %REF%
+          git submodule update --init --recursive --depth 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -162,16 +165,17 @@ jobs:
           }
           $global:LASTEXITCODE = 0   # robocopy возвращает 1-7 при успехе
 
-          # Windows ищет DLL в папке самого exe, а не в ../bin. Helper-процессы из libexec
-          # (WebContent и др.) тоже линкуются с skia/icu/libxml2 и т.д., поэтому докладываем
-          # им DLL из bin. Qt6* пропускаем: helper-процессам Qt не нужен.
+          # На Windows Ladybird ищет helper-процессы (RequestServer, WebContent, ...) рядом с
+          # Ladybird.exe, а не в libexec (проверено запуском: пути bin/RequestServer и ./RequestServer).
+          # Поэтому переносим содержимое libexec в bin, DLL для них уже лежат в bin.
           $binDir = Join-Path $dist "bin"
           $libexecDir = Join-Path $dist "libexec"
-          if ((Test-Path $binDir) -and (Test-Path $libexecDir)) {
-            Get-ChildItem $binDir -File -Filter *.dll | Where-Object { $_.Name -notlike "Qt6*" } | ForEach-Object {
-              $target = Join-Path $libexecDir $_.Name
-              if (-not (Test-Path $target)) { Copy-Item $_.FullName $target }
+          if (Test-Path $libexecDir) {
+            Get-ChildItem $libexecDir -Force | ForEach-Object {
+              $t = Join-Path $binDir $_.Name
+              if (-not (Test-Path $t)) { Move-Item $_.FullName $t }
             }
+            Remove-Item $libexecDir -Recurse -Force
           }
 
           # VC++ runtime (app-local): чтобы браузер работал без установленного Redistributable.
@@ -180,16 +184,13 @@ jobs:
             $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           if ($crt) {
-            foreach ($d in @($binDir, $libexecDir)) {
-              if (Test-Path $d) { Copy-Item (Join-Path $crt.FullName "*.dll") $d -Force }
-            }
+            Copy-Item (Join-Path $crt.FullName "*.dll") $binDir -Force
           } else {
             Write-Warning "VC++ runtime не найден (VCToolsRedistDir) - на чистой Windows понадобится Redistributable."
           }
 
           # include/ и lib/ нужны только для разработки. Удаляем, если в lib нет DLL.
-          # libexec/ (WebContent, RequestServer, ImageDecoder, ...) и share/ НЕ удаляем:
-          # это процессы и ресурсы, без которых браузер не запустится.
+          # share/ НЕ удаляем: там ресурсы (шрифты, стили, внутренние страницы).
           foreach ($d in @("include", "lib")) {
             $p = Join-Path $dist $d
             if ((Test-Path $p) -and -not (Get-ChildItem $p -Recurse -Filter *.dll -ErrorAction SilentlyContinue)) {
@@ -198,8 +199,8 @@ jobs:
           }
           Get-ChildItem $dist -Recurse -File -Include *.pdb,*.lib,*.exp,*.ilk | Remove-Item -Force
 
-          # Раскладку bin/libexec/share не меняем: Ladybird ищет helper-процессы и ресурсы
-          # относительно папки exe. Вместо этого кладём в корень архива запускалку.
+          # Раскладка: bin/ (exe + DLL + helper-процессы) и share/ (ресурсы).
+          # В корень архива кладём запускалку.
           if (-not (Test-Path (Join-Path $dist "bin\Ladybird.exe"))) {
             Write-Warning "bin\Ladybird.exe не найден - проверьте имя exe в списке файлов ниже."
           }
