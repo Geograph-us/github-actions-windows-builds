@@ -1,4 +1,4 @@
-name: Build Telegram (Windows x64 Release)
+name: Build Telegram Desktop (Windows x64 Release)
 
 # Основано на официальном .github/workflows/win.yml из telegramdesktop/tdesktop,
 # см.: https://github.com/telegramdesktop/tdesktop/blob/dev/docs/building-win-x64.md
@@ -94,15 +94,33 @@ jobs:
           restore-keys: |
             win-x64-libs-
 
-      # skip-debug: собираем только Release-версии третьесторонних библиотек,
-      # раз цель - рабочий дистрибутив, а не отладочная CI-сборка апстрима.
-      # Официальный workflow использует симметричный флаг skip-release для
-      # обратного случая - если skip-debug вдруг не существует в вашей версии
-      # скрипта, уберите его и соберутся обе конфигурации (дольше, но надёжно).
+      # skip-debug не существует в этой версии скрипта (проверено на практике) -
+      # собираются обе конфигурации третьесторонних библиотек, Debug и Release.
+      #
+      # Ретраи: на чистой машине первый `pacman -Syu` внутри win.bat обновляет
+      # ядро самого MSYS2 и убивает текущий терминал ("all MSYS2 processes will
+      # be closed"), а сразу следующий вызов пакетов иногда попадает на ещё не
+      # до конца синхронизированную базу репозитория ("target not found" для
+      # одного-двух пакетов). Это известная гонка первого запуска MSYS2 в CI,
+      # а не проблема самой сборки - retry почти всегда чинит ситуацию, и
+      # промежуточный прогресс (уже собранные из 33 шагов) не теряется.
       - name: Prepare third-party libraries
         working-directory: D:\t
         run: |
-          Telegram\build\prepare\win.bat silent
+          setlocal enabledelayedexpansion
+          set ATTEMPTS=0
+          :retry
+          set /a ATTEMPTS+=1
+          call Telegram\build\prepare\win.bat silent
+          if !ERRORLEVEL! EQU 0 goto :done
+          if !ATTEMPTS! GEQ 3 (
+            echo win.bat не удался после !ATTEMPTS! попыток
+            exit /b 1
+          )
+          echo win.bat не удался, попытка !ATTEMPTS!, повтор через 30с...
+          timeout /t 30 /nobreak >nul
+          goto :retry
+          :done
 
       - name: Configure api_id/api_hash
         id: api
