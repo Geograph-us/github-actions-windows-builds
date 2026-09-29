@@ -1,0 +1,213 @@
+name: Build Telegram (Windows x64 Release)
+
+# Основано на официальном .github/workflows/win.yml из telegramdesktop/tdesktop,
+# см.: https://github.com/telegramdesktop/tdesktop/blob/dev/docs/building-win-x64.md
+#
+# ВАЖНО про API-креды: чтобы клиент работал с обычным аккаунтом, нужны свои
+# api_id/api_hash с https://my.telegram.org (Api development tools). Задайте их
+# как секреты репозитория TDESKTOP_API_ID и TDESKTOP_API_HASH. Без них сборка
+# уйдёт в TDESKTOP_API_TEST=ON - это тестовый DC Telegram, обычным аккаунтом
+# авторизоваться там нельзя, годится только чтобы убедиться, что билд стартует.
+#
+# ВАЖНО про Qt: официальный CI кладёт в артефакт только Telegram.exe и
+# Updater.exe, без единой DLL рядом - похоже, что Qt собирается статически
+# скриптом prepare/win.bat. Я не проверял это на реальной сборке, поэтому в
+# конце есть диагностический шаг (dumpbin), который предупредит в логе, если
+# каких-то DLL всё же не хватает рядом с exe.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ветка/тег/коммит tdesktop для сборки"
+        required: false
+        default: "dev"
+  push:
+    tags:
+      - "tg-v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write   # нужно для создания GitHub Release
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Enable Windows/Git long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      # tdesktop сам активно линкует submodules (webrtc, breakpad, range-v3 и т.д.),
+      # а deep build-деревья Qt/WebRTC легко упираются в MAX_PATH. Как и в сборке
+      # Ladybird, клонируем напрямую в короткий путь у корня диска, а не в
+      # глубокий GITHUB_WORKSPACE (D:\a\<owner>\<repo>\<repo>\...).
+      - name: Clone tdesktop into short path (D:\t)
+        env:
+          REF: ${{ inputs.ref || 'dev' }}
+        run: |
+          git clone --recurse-submodules --shallow-submodules --depth 1 --branch %REF% https://github.com/telegramdesktop/tdesktop.git D:\t
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # Ключ кэша - хеш самого скрипта подготовки третьесторонних либ. Если
+      # prepare/prepare.py (и то, что он тянет) не менялся, ThirdParty/Libraries
+      # распаковываются из кэша вместо многочасовой пересборки FFmpeg/WebRTC/Qt.
+      - name: Compute cache key
+        id: cachekey
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash "D:\t\Telegram\build\prepare\prepare.py").Hash
+          echo "hash=$h" >> $env:GITHUB_OUTPUT
+
+      - name: ThirdParty cache
+        uses: actions/cache@v4
+        with:
+          path: D:\t\ThirdParty
+          key: win-x64-third-party-${{ steps.cachekey.outputs.hash }}
+          restore-keys: |
+            win-x64-third-party-
+
+      - name: Libraries cache
+        uses: actions/cache@v4
+        with:
+          path: D:\t\Libraries
+          key: win-x64-libs-${{ steps.cachekey.outputs.hash }}
+          restore-keys: |
+            win-x64-libs-
+
+      # skip-debug: собираем только Release-версии третьесторонних библиотек,
+      # раз цель - рабочий дистрибутив, а не отладочная CI-сборка апстрима.
+      # Официальный workflow использует симметричный флаг skip-release для
+      # обратного случая - если skip-debug вдруг не существует в вашей версии
+      # скрипта, уберите его и соберутся обе конфигурации (дольше, но надёжно).
+      - name: Prepare third-party libraries
+        working-directory: D:\t
+        run: |
+          Telegram\build\prepare\win.bat skip-debug silent
+
+      - name: Configure api_id/api_hash
+        id: api
+        shell: pwsh
+        env:
+          TDESKTOP_API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          TDESKTOP_API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        run: |
+          if ($env:TDESKTOP_API_ID -and $env:TDESKTOP_API_HASH) {
+            echo "flag=-D TDESKTOP_API_ID=$env:TDESKTOP_API_ID -D TDESKTOP_API_HASH=$env:TDESKTOP_API_HASH" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning "TDESKTOP_API_ID/TDESKTOP_API_HASH не заданы в секретах - используется тестовый DC (TDESKTOP_API_TEST), обычным аккаунтом авторизоваться не получится."
+            echo "flag=-D TDESKTOP_API_TEST=ON" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Configure and build (Release)
+        working-directory: D:\t\Telegram
+        shell: cmd
+        run: |
+          call configure.bat x64 ${{ steps.api.outputs.flag }} -D CMAKE_CONFIGURATION_TYPES=Release
+          cmake --build ..\out --config Release --parallel
+
+      - name: Determine package version
+        id: version
+        shell: pwsh
+        working-directory: D:\t
+        run: |
+          $sha = (git rev-parse --short HEAD)
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/', '' } else { $sha }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Assemble distributable folder
+        shell: pwsh
+        run: |
+          $out  = "D:\t\out\Release"
+          $dist = "D:\t\dist"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item (Join-Path $out "Telegram.exe") $dist
+          if (Test-Path (Join-Path $out "Updater.exe")) {
+            Copy-Item (Join-Path $out "Updater.exe") $dist
+          }
+
+          # Диагностика: если Qt/третьесторонние либы на самом деле не статические,
+          # dumpbin покажет, каких DLL не хватает рядом с exe.
+          if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+            $sys = Join-Path $env:WINDIR "System32"
+            $missing = @()
+            foreach ($f in Get-ChildItem $dist -File -Include *.exe) {
+              $deps = dumpbin /dependents $f.FullName | Select-String '^\s+(\S+\.dll)\s*$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+              foreach ($dll in $deps) {
+                if ($dll -match '^(api-ms-win|ext-ms-win)') { continue }
+                if (-not (Test-Path (Join-Path $dist $dll)) -and -not (Test-Path (Join-Path $sys $dll))) {
+                  $missing += "$($f.Name) -> $dll"
+                }
+              }
+            }
+            $global:LASTEXITCODE = 0
+            if ($missing.Count -gt 0) {
+              Write-Warning "Похоже, Telegram.exe линкуется не статически - не найдены зависимости:`n$(($missing | Sort-Object -Unique) -join "`n")`nНужные DLL лежат где-то в D:\t\Libraries или D:\t\ThirdParty - пришлите этот список, чтобы добавить их копирование."
+            } else {
+              Write-Host "Проверка зависимостей: все DLL на месте (либо сборка статическая)."
+            }
+          }
+
+          Get-ChildItem $dist -Recurse -File
+
+      - name: Package into zip
+        shell: pwsh
+        run: |
+          $zipName = "telegram-windows-x64-${{ steps.version.outputs.version }}.zip"
+          Compress-Archive -Path "D:\t\dist\*" -DestinationPath "D:\t\$zipName"
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      # Страховка: если публикация релиза упадёт, результат сборки не пропадёт.
+      - name: Upload artifact (safety net)
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-windows-x64-${{ steps.version.outputs.version }}
+          path: D:\t\dist
+          if-no-files-found: error
+          retention-days: 3
+
+      # Публикуем zip в Releases вашего репозитория (не telegramdesktop/tdesktop!).
+      # Шаг НЕ запускается из D:\t, иначе gh определил бы репозиторий по git-remote tdesktop.
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_SHA: ${{ steps.version.outputs.sha }}
+          TG_VERSION: ${{ steps.version.outputs.version }}
+          TG_REF: ${{ inputs.ref || 'dev' }}
+        run: |
+          $zip   = "D:\t\$env:ZIP_NAME"
+          $repo  = $env:GITHUB_REPOSITORY
+          $isTag = $env:GITHUB_REF -like 'refs/tags/*'
+          $tag   = if ($isTag) { $env:GITHUB_REF_NAME } else { "telegram-$env:TG_VERSION" }
+          $notes = "tdesktop ref: $env:TG_REF, commit: $env:TG_SHA"
+
+          gh release view $tag --repo $repo 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber --repo $repo
+          } else {
+            $ghArgs = @($tag, $zip, "--repo", $repo, "--title", "Telegram Desktop Windows x64 $tag", "--notes", $notes, "--target", $env:GITHUB_SHA)
+            if (-not $isTag) { $ghArgs += "--prerelease" }
+            gh release create @ghArgs
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Не удалось опубликовать релиз" }
